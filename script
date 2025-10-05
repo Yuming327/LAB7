@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+vision_lab7.py
+
+Single-file ROS2 node for Lab 7 (Vision):
+ - camera capture from /dev/video2 at 960x540 @60Hz (v4l2)
+ - camera calibration from images in calibration/
+ - estimate camera mounting height using resource/cone_x40cm.png (known x_car = 0.40 m)
+ - pixel_to_car(u, v) -> (x_car, y_car)
+ - simple lane detection (HSV + contours) and overlay
+ - red cone detection + distance measurement on live frames
+
+Usage:
+    ros2 run roboracer_lab7 vision_lab7
+(assuming package and entry point are configured in setup.py)
+"""
+import rclpy
+from rclpy.node import Node
+import cv2
+import numpy as np
+import os
+import glob
+import math
+from datetime import datetime
+
+# ----- CONFIG -----
+VIDEO_DEVICE = '/dev/video2'
+FRAME_W, FRAME_H = 960, 540
+TARGET_FPS = 60
+CHESSBOARD_SIZE = (6, 8)      # inner corners: 6 x 8 (as described in lab)
+SQUARE_SIZE = 0.025           # 25 mm = 0.025 m
+KNOWN_CONE_X = 0.40           # cone_x40cm.png -> x_car = 0.40 m
+# -------------------
+
+class VisionLab7Node(Node):
+    def __init__(self):
+        super().__init__('vision_lab7')
+        self.get_logger().info("VisionLab7 node starting")
+
+        # set up file paths (calibration and resource folder should be next to this file)
+        self.base_dir = os.path.dirname(os.path.realpath(__file__))
+        self.calib_dir = os.path.join(self.base_dir, '..', 'calibration')
+        self.resource_dir = os.path.join(self.base_dir, '..', 'resource')
+
+        # camera intrinsics and distortion
+        self.K = None
+        self.dist = None
+        self.H = None  # mounting height (meters)
+
+        # open camera
+        self.cap = cv2.VideoCapture(VIDEO_DEVICE, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+        self.cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+
+        if not self.cap.isOpened():
+            self.get_logger().error(f"Failed to open {VIDEO_DEVICE}")
+        else:
+            self.get_logger().info(f"Opened camera {VIDEO_DEVICE} {FRAME_W}x{FRAME_H}@{TARGET_FPS}Hz")
+
+        # timer ~60Hz
+        self.timer = self.create_timer(1.0 / TARGET_FPS, self.loop)
+
+        # state
+        self.last_fps_time = datetime.now()
+        self.frame_count = 0
+
+        # try to auto-calibrate if images exist
+        try:
+            if os.path.isdir(self.calib_dir) and len(glob.glob(os.path.join(self.calib_dir, '*'))) > 0:
+                self.get_logger().info("Calibration images found — running calibration on start")
+                self.K, self.dist = self.calibrate_camera()
+                if self.K is not None:
+                    self.get_logger().info(f"Intrinsic K:\n{self.K}")
+                    self.H = self.estimate_height_from_known_cone()
+                    if self.H is not None:
+                        self.get_logger().info(f"Estimated mounting height H = {self.H:.3f} m")
+        except Exception as e:
+            self.get_logger().warn(f"Auto-calibration failed: {e}")
+
+    # ---------------- Calibration ----------------
+    def calibrate_camera(self):
+        """
+        Calibrate the camera using chessboard images in self.calib_dir.
+        Returns (K, dist) where K is 3x3 and dist is vector of distortion coefs.
+        """
+        images = sorted(glob.glob(os.path.join(self.calib_dir, '*')))
+        if not images:
+            self.get_logger().warn("No calibration images found")
+            return None, None
+
+        objp = np.zeros((CHESSBOARD_SIZE[0]*CHESSBOARD_SIZE[1], 3), np.float32)
+        # grid indexing: (cols, rows)
+        objp[:,:2] = np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]].T.reshape(-1,2)
+        objp *= SQUARE_SIZE
+
+        objpoints = []
+        imgpoints = []
+
+        sample_count = 0
+        for fname in images:
+            img = cv2.imread(fname)
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            ret, corners = cv2.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
+            if ret:
+                sample_count += 1
+                # refine corners
+                corners2 = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1),
+                                             (cv2.TermCriteria_EPS + cv2.TermCriteria_COUNT, 30, 0.001))
+                objpoints.append(objp)
+                imgpoints.append(corners2)
+                # debug draw
+                # cv2.drawChessboardCorners(img, CHESSBOARD_SIZE, corners2, ret)
+                # cv2.imshow('cb', img); cv2.waitKey(100)
+        if sample_count < 1:
+            self.get_logger().warn("No valid chessboard detections found in calibration images")
+            return None, None
+
+        ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+        if not ret:
+            self.get_logger().warn("calibrateCamera returned false")
+            return None, None
+        self.get_logger().info(f"Calibration succeeded with {sample_count} images")
+        return K, dist
+
+    def estimate_height_from_known_cone(self, cone_image_name='cone_x40cm.png'):
+        """
+        Use the provided image with a cone at known x_car distance (KNOWN_CONE_X)
+        to estimate camera mounting height H (meters).
+        Approach:
+            - detect the cone bottom pixel v (use red color mask + largest contour)
+            - using intrinsic K: Z = H * fy / (v - cy) => H = Z_known * (v - cy) / fy
+        """
+        path = os.path.join(self.resource_dir, cone_image_name)
+        if not os.path.isfile(path):
+            self.get_logger().warn(f"Known cone image not found: {path}")
+            return None
+        if self.K is None:
+            self.get_logger().warn("Intrinsic K unknown - cannot compute H")
+            return None
+
+        img = cv2.imread(path)
+        # find red cone base -> use red HSV mask
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # red has two hue ranges
+        lower1 = np.array([0, 80, 50])
+        upper1 = np.array([10, 255, 255])
+        lower2 = np.array([170, 80, 50])
+        upper2 = np.array([180, 255, 255])
+        m1 = cv2.inRange(hsv, lower1, upper1)
+        m2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(m1, m2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            self.get_logger().warn("No red contour found in known cone image")
+            return None
+        # pick largest contour
+        c = max(contours, key=cv2.contourArea)
+        x,y,w,h = cv2.boundingRect(c)
+        # lower-right corner of nearest red cone: (x+w, y+h)
+        br_x = x + w
+        br_y = y + h
+        # optional: undistort the point
+        und = self.undistort_points(np.array([[br_x, br_y]], dtype=np.float32))[0]
+        u_corr, v_corr = und[0], und[1]
+        fx = self.K[0,0]; fy = self.K[1,1]; cx = self.K[0,2]; cy = self.K[1,2]
+        # Using derived formula: Z = H * fy / (v - cy)  ->  H = Z_known * (v - cy) / fy
+        v_minus_cy = v_corr - cy
+        if abs(v_minus_cy) < 1e-6:
+            self.get_logger().warn("v - cy is too small; cannot compute H")
+            return None
+        H = KNOWN_CONE_X * (v_minus_cy) / fy
+        return float(H)
+
+    def undistort_points(self, pts_pix):
+        """
+        pts_pix: Nx2 float32 array of pixel coords [[u, v], ...]
+        returns Nx2 array of undistorted pixel coords (approx).
+        Uses cv2.undistortPoints with P = K to map back to pixel coords.
+        """
+        if self.K is None or self.dist is None:
+            return pts_pix
+        pts = pts_pix.reshape(-1,1,2)
+        und = cv2.undistortPoints(pts, self.K, self.dist, P=self.K)
+        und = und.reshape(-1,2)
+        return und
+
+    # ---------------- Pixel -> Car ----------------
+    def pixel_to_car(self, u, v):
+        """
+        Convert pixel coordinates (u, v) to car-frame distances (x_car, y_car).
+        Assumptions:
+          - camera optical axis is parallel to ground (no pitch)
+          - camera frame: X right, Y down, Z forward
+          - ground plane Y = H (camera at height H above ground)
+        Derived:
+          Z = H * fy / (v - cy)
+          X = (u - cx) * Z / fx
+          Return x_car = Z (forward meters), y_car = X (lateral meters; positive is right)
+        """
+        if self.K is None or self.H is None:
+            self.get_logger().warn("K or H unknown; cannot convert pixel to car coords")
+            return None, None
+        # undistort pixel first
+        und = self.undistort_points(np.array([[u, v]], dtype=np.float32))[0]
+        u_corr, v_corr = float(und[0]), float(und[1])
+        fx = self.K[0,0]; fy = self.K[1,1]; cx = self.K[0,2]; cy = self.K[1,2]
+        denom = (v_corr - cy)
+        if denom == 0:
+            return None, None
+        Z = (self.H * fy) / denom
+        X = (u_corr - cx) * Z / fx
+        x_car = float(Z)
+        y_car = float(X)
+        return x_car, y_car
+
+    # ---------------- Lane detection ----------------
+    def detect_lane_overlay(self, frame):
+        """
+        Returns overlayed image with green contours on yellow lanes.
+        """
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # tuned for typical yellow; tweak if needed
+        lower_y = np.array([18, 60, 120])
+        upper_y = np.array([35, 255, 255])
+        mask = cv2.inRange(hsv, lower_y, upper_y)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+        # optional: focus on bottom half for lane
+        h = frame.shape[0]
+        mask[0:int(h*0.25), :] = 0
+        edges = cv2.Canny(mask, 100, 200)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        overlay = frame.copy()
+        if contours:
+            cv2.drawContours(overlay, contours, -1, (0,255,0), 2)
+        return overlay
+
+    # ---------------- Red cone detection ----------------
+    def detect_nearest_red_cone(self, frame):
+        """
+        Return bounding rect of nearest red cone in frame as (x,y,w,h) or None.
+        Strategy: red mask -> largest contour -> boundingRect.
+        """
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower1 = np.array([0, 80, 50])
+        upper1 = np.array([10, 255, 255])
+        lower2 = np.array([170, 80, 50])
+        upper2 = np.array([180, 255, 255])
+        m1 = cv2.inRange(hsv, lower1, upper1)
+        m2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(m1, m2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        # choose contour with largest area
+        c = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(c)
+        if area < 200:  # too small -> ignore
+            return None
+        x,y,w,h = cv2.boundingRect(c)
+        return (x,y,w,h)
+
+    # ---------------- Main loop ----------------
+    def loop(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            self.get_logger().error("Frame read failed")
+            return
+
+        self.frame_count += 1
+        now = datetime.now()
+        elapsed = (now - self.last_fps_time).total_seconds()
+        if elapsed >= 1.0:
+            fps = self.frame_count / elapsed
+            self.get_logger().info(f"FPS: {fps:.1f}")
+            self.last_fps_time = now
+            self.frame_count = 0
+
+        # lane overlay
+        overlay = self.detect_lane_overlay(frame)
+
+        # detect nearest red cone and draw
+        cone = self.detect_nearest_red_cone(frame)
+        if cone:
+            x,y,w,h = cone
+            cv2.rectangle(overlay, (x,y), (x+w, y+h), (0,0,255), 2)
+            # bottom-right corner is (x+w, y+h)
+            br_u, br_v = x + w, y + h
+            # compute distance if we have calibration
+            if self.K is not None and self.H is not None:
+                x_car, y_car = self.pixel_to_car(br_u, br_v)
+                if x_car is not None:
+                    text = f"x={x_car:.2f} m, y={y_car:.2f} m"
+                    cv2.putText(overlay, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        else:
+            cv2.putText(overlay, "No red cone detected", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
+
+        # info text
+        if self.K is not None:
+            k_text = f"K: fx={self.K[0,0]:.1f}, fy={self.K[1,1]:.1f}"
+        else:
+            k_text = "K: unknown (press 'c' to calibrate)"
+        cv2.putText(overlay, k_text, (10, FRAME_H - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        if self.H is not None:
+            cv2.putText(overlay, f"H={self.H:.3f} m", (10, FRAME_H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        else:
+            cv2.putText(overlay, "H: unknown (press 'c' to compute)", (10, FRAME_H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        cv2.imshow("Vision Lab7 (lane + cone)", overlay)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:
+            # quit: release everything and shutdown node
+            self.get_logger().info("Exit requested")
+            self.cap.release()
+            cv2.destroyAllWindows()
+            self.destroy_node()
+            rclpy.shutdown()
+        elif key == ord('c'):
+            self.get_logger().info("Manual calibrate requested (calibrateCamera then estimate H)")
+            K, dist = self.calibrate_camera()
+            if K is not None:
+                self.K, self.dist = K, dist
+                self.get_logger().info(f"New K:\n{self.K}")
+                H_new = self.estimate_height_from_known_cone()
+                if H_new is not None:
+                    self.H = H_new
+                    self.get_logger().info(f"New H = {self.H:.3f} m")
+        elif key == ord('d'):
+            # compute distance to cone in current frame if detected
+            if cone and self.K is not None and self.H is not None:
+                br_u, br_v = x + w, y + h
+                xc, yc = self.pixel_to_car(br_u, br_v)
+                self.get_logger().info(f"Distance to detected cone: x={xc:.3f} m, y={yc:.3f} m")
+            else:
+                self.get_logger().info("No cone or K/H unknown; cannot compute distance")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisionLab7Node()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            node.cap.release()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
